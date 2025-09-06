@@ -10,20 +10,41 @@ function clamp(n: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, n));
 }
 
+// Parse "H:MM:SS" or "MM:SS" -> seconds (null if invalid)
+function parseHMS(s: string): number | null {
+  const t = s.trim();
+  if (!t) return null;
+  const m = t.match(/^(\d{1,2}):([0-5]?\d)(?::([0-5]?\d))?$/);
+  if (!m) return null;
+  const h = m[3] !== undefined ? Number(m[1]) : 0;
+  const mm = m[3] !== undefined ? Number(m[2]) : Number(m[1]);
+  const ss = m[3] !== undefined ? Number(m[3]) : Number(m[2]);
+  return h * 3600 + mm * 60 + ss;
+}
+
+function formatHMS(sec: number) {
+  const s = Math.max(0, Math.round(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`
+    : `${m}:${String(ss).padStart(2, "0")}`;
+}
+
 // Relative intensity from delta to Vmax (smooth logistic)
 function riFromDeltaV(delta: number) {
   const ri = 0.35 + 0.75 / (1 + Math.exp(delta - 1.5));
   return clamp(ri, 0, 1.15);
 }
 
-// Freshness factor from rest since last climb (days).
-// Heuristic: 0d → 0.85x, +0.02/day up to 10d → ~1.05x cap.
+// Freshness factor from rest since last climb (days). 0d → 0.85x, ramps to ~1.05x.
 function restFreshness(days: number) {
   const f = 0.85 + 0.02 * Math.min(Math.max(days, 0), 10);
   return clamp(f, 0.75, 1.1);
 }
 
-// Density factor from total TUT vs. total rest within bouldering section
+// Density factor from total TUT vs. total rest inside a bouldering block
 // DF = ( TUT_total / (TUT_total + total_rest) ) ^ densityExp
 function densityFactor(totalTUTs: number, totalRest: number, densityExp = 0.5) {
   const ratio = totalTUTs / Math.max(1, totalTUTs + totalRest);
@@ -31,26 +52,46 @@ function densityFactor(totalTUTs: number, totalRest: number, densityExp = 0.5) {
 }
 
 // Fatigue/novelty weight for climb i (1-indexed). 0 disables decay.
-// w_i = exp(-fatigueRate * (i-1))
 function climbWeight(i: number, fatigueRate: number) {
   if (fatigueRate <= 0) return 1;
   return Math.exp(-fatigueRate * (i - 1));
 }
 
 /* ---------------------------
-   Bouldering with time-per-climb
+   Bouldering models
 ----------------------------*/
 type Climb = { grade: number; tutSec: number };
 
-function boulderingTLI(params: {
-  vMax: number;
-  restDays: number;
-  avgRestBetweenClimbsSec: number;
-  densityExp: number;
+type BoulderingAggregate = {
+  climbTimeSec: number;      // "Climb Time"
+  totalRestSec: number;      // "Total Rest"
+  totalTimeSec?: number;     // optional "Total Time" (not used in math)
+  grades: number[];          // grades touched (time split evenly across)
   useDensity: boolean;
-  fatigueRate: number; // e.g. 0.02; set 0 to disable
-  climbs: Climb[];
-}) {
+  densityExp: number;
+  restDays: number;
+};
+
+type BoulderingPerClimb = {
+  climbs: Climb[];                 // grade + TUT per climb
+  avgRestBetweenClimbsSec: number; // used to estimate total rest
+  useDensity: boolean;
+  densityExp: number;
+  restDays: number;
+  fatigueRate: number;             // per-climb decay; 0 disables
+  vMax: number;
+  mode: "per-climb";
+};
+
+type BoulderingAggregateMode = {
+  aggregate: BoulderingAggregate;
+  vMax: number;
+  mode: "aggregate";
+};
+
+type BoulderingInputs = (BoulderingPerClimb | BoulderingAggregateMode) & { vMax: number };
+
+function boulderingTLI_fromPerClimb(params: BoulderingPerClimb & { vMax: number }) {
   const {
     vMax,
     restDays,
@@ -77,12 +118,38 @@ function boulderingTLI(params: {
 
   return {
     TLI_boulder: FR * DF * sum,
-    meta: { totalTUT, totalRestWithin, FR, DF },
+    meta: { totalTUT, totalRestWithin, FR, DF, n: totalClimbs, usedMode: "per-climb" as const },
   };
 }
 
+function boulderingTLI_fromAggregate(params: BoulderingAggregate & { vMax: number }) {
+  const { vMax, restDays, useDensity, densityExp, climbTimeSec, totalRestSec, grades } = params;
+
+  const totalTUT = Math.max(0, climbTimeSec);
+  const totalRestWithin = Math.max(0, totalRestSec);
+  const FR = restFreshness(restDays);
+  const DF = useDensity ? densityFactor(totalTUT, totalRestWithin, densityExp) : 1;
+
+  const perGradeT = grades.length > 0 ? totalTUT / grades.length : 0;
+
+  const sum = grades.reduce((acc, g) => acc + riFromDeltaV(vMax - g) * perGradeT, 0);
+
+  return {
+    TLI_boulder: FR * DF * sum,
+    meta: { totalTUT, totalRestWithin, FR, DF, n: undefined, usedMode: "aggregate" as const },
+  };
+}
+
+function boulderingTLI(input: BoulderingInputs) {
+  if (input.mode === "per-climb") {
+    return boulderingTLI_fromPerClimb(input);
+  } else {
+    return boulderingTLI_fromAggregate({ vMax: input.vMax, ...input.aggregate });
+  }
+}
+
 /* ---------------------------
-   Hangboard (single row model)
+   Hangboard (single row)
 ----------------------------*/
 function relEdge(edgeMM: number, k = 0.45) {
   return Math.pow(20 / edgeMM, k);
@@ -128,17 +195,38 @@ export default function Page() {
   };
 
   /* -------- Bouldering state -------- */
+  const [mode, setMode] = useState<"per-climb" | "aggregate">("aggregate");
+
+  // Shared
   const [vMax, setVMax] = useState(8); // V8
   const [restDays, setRestDays] = useState(2);
-  const [avgRestBetweenClimbsSec, setAvgRestBetweenClimbsSec] = useState(90); // avg rest between climbs (s)
+
+  // Per-climb mode
+  const [avgRestBetweenClimbsSec, setAvgRestBetweenClimbsSec] = useState(90);
   const [densityExp, setDensityExp] = useState(0.5);
   const [useDensity, setUseDensity] = useState(true);
-  const [fatigueRate, setFatigueRate] = useState(0.02); // ~2% decay per climb; 0 disables
+  const [fatigueRate, setFatigueRate] = useState(0.02);
   const [climbs, setClimbs] = useState<Climb[]>([
     { grade: 6, tutSec: 25 },
     { grade: 7, tutSec: 30 },
     { grade: 8, tutSec: 35 },
   ]);
+
+  // Aggregate mode — THREE TIME BOXES
+  const [aggClimbTime, setAggClimbTime] = useState("14:19");
+  const [aggRestTime, setAggRestTime] = useState("1:13:27");
+  const [aggTotalTime, setAggTotalTime] = useState("1:27:47");
+  const [aggGrades, setAggGrades] = useState<number[]>([6, 7, 8]);
+  const [aggUseDensity, setAggUseDensity] = useState(true);
+  const [aggDensityExp, setAggDensityExp] = useState(0.5);
+
+  // Parsed aggregate seconds (robust to either HH:MM:SS or MM:SS)
+  const aggClimbSec = useMemo(() => parseHMS(aggClimbTime) ?? 0, [aggClimbTime]);
+  const aggRestSec = useMemo(() => parseHMS(aggRestTime) ?? 0, [aggRestTime]);
+  const aggTotalSec = useMemo(
+    () => parseHMS(aggTotalTime) ?? aggClimbSec + aggRestSec,
+    [aggTotalTime, aggClimbSec, aggRestSec]
+  );
 
   /* -------- Hangboard (single row) -------- */
   const [hb, setHb] = useState({
@@ -159,19 +247,33 @@ export default function Page() {
   const [avg28d, setAvg28d] = useState(1200);
 
   /* -------- Calculations -------- */
-  const { TLI_boulder, meta } = useMemo(
-    () =>
-      boulderingTLI({
-        vMax,
-        restDays,
-        avgRestBetweenClimbsSec,
-        densityExp,
-        useDensity,
-        fatigueRate,
-        climbs,
-      }),
-    [vMax, restDays, avgRestBetweenClimbsSec, densityExp, useDensity, fatigueRate, climbs]
-  );
+  const boulderInput: BoulderingInputs =
+    mode === "per-climb"
+      ? {
+          mode,
+          vMax,
+          restDays,
+          avgRestBetweenClimbsSec,
+          densityExp,
+          useDensity,
+          fatigueRate,
+          climbs,
+        }
+      : {
+          mode,
+          vMax,
+          aggregate: {
+            climbTimeSec: aggClimbSec,
+            totalRestSec: aggRestSec,
+            totalTimeSec: aggTotalSec,
+            grades: aggGrades,
+            useDensity: aggUseDensity,
+            densityExp: aggDensityExp,
+            restDays,
+          },
+        };
+
+  const { TLI_boulder, meta } = useMemo(() => boulderingTLI(boulderInput), [JSON.stringify(boulderInput)]);
 
   const hbCalc = useMemo(() => hangboardSetTLI(hb), [hb]);
   const TLI_hangboard = hbCalc.perSet * hb.sets;
@@ -179,163 +281,238 @@ export default function Page() {
   const ratioToAvg = avg28d > 0 ? TLI_total / avg28d : 1;
   const spikeWarn = avg28d > 0 && TLI_total > 1.4 * avg28d;
 
-  // Recommendation: rest days suggestion based on ratio to average and absolute TLI
   const recRestDays = recommendRestDays(TLI_total, ratioToAvg);
 
-  // Per-climb weights (for explanation preview)
-  const w1 = climbWeight(1, fatigueRate);
-  const w20 = climbWeight(20, fatigueRate);
+  const w1 = climbWeight(1, mode === "per-climb" ? fatigueRate : 0);
+  const w20 = climbWeight(20, mode === "per-climb" ? fatigueRate : 0);
 
   return (
     <main style={pageStyle}>
       <h1 style={{ fontSize: 32, fontWeight: 800, marginBottom: 6 }}>
-        Climbing Tendon Load — Time-per-Climb
+        Climbing Tendon Load — Aggregate or Per-climb
       </h1>
       <p style={{ color: "#1f2937", marginBottom: 20, lineHeight: 1.55 }}>
-        This calculator estimates <strong>Tendon Load Index (TLI)</strong> for your session using{" "}
-        <em>relative intensity × time under tension</em> and accounts for <em>density</em> and a small{" "}
-        <em>per-climb fatigue/novelty</em> effect. Earlier climbs can count slightly more than later ones.
+        Choose <strong>Aggregate</strong> (three time boxes) or <strong>Per-climb</strong> (grade + TUT for each climb),
+        then we’ll compute <strong>Tendon Load Index (TLI)</strong>.
       </p>
 
-      {/* How metrics work */}
       <section style={cardStyle}>
-        <h2 style={h2Style}>What these numbers mean</h2>
-        <ul style={ulStyle}>
-          <li>
-            <strong>TLI (RI·seconds)</strong> = sum over climbs/sets of{" "}
-            <em>Relative Intensity (RI)</em> × <em>Time Under Tension (TUT)</em>.
-          </li>
-          <li>
-            <strong>RI (boulders)</strong> comes from how each climb’s grade compares to your recent max (smooth curve).
-          </li>
-          <li>
-            <strong>Per-climb impact</strong>: we apply a small decay per climb:{" "}
-            <code>wᵢ = exp(−fatigueRate × (i−1))</code>. With fatigueRate={fatigueRate.toFixed(3)}, the 1st climb weighs{" "}
-            {w1.toFixed(2)}× and the 20th weighs {w20.toFixed(2)}×. Set fatigueRate to 0 to disable.
-          </li>
-          <li>
-            <strong>Density factor (bouldering)</strong>:{" "}
-            <code>DF = (TUT_total / (TUT_total + total_rest))^exp</code>. More rest lowers density (and load). We derive{" "}
-            <code>total_rest ≈ avgRestBetweenClimbs × (nClimbs−1)</code>.
-          </li>
-          <li>
-            <strong>Rest since last climb</strong>: nudges capacity via a freshness factor (0.85× → ~1.05×).
-          </li>
-          <li>
-            <strong>Spike warning</strong>: flags if today &gt; 40% above your 4-week average.
-          </li>
-        </ul>
+        <h2 style={h2Style}>Mode</h2>
+        <Toggle
+          label=""
+          value={mode}
+          options={[
+            { v: "aggregate", label: "Aggregate (3 time boxes)" },
+            { v: "per-climb", label: "Per-climb (grade + TUT)" },
+          ]}
+          onChange={(v) => setMode(v as any)}
+        />
       </section>
 
-      {/* Bouldering */}
+      {/* Common inputs */}
       <section style={cardStyle}>
-        <h2 style={h2Style}>Bouldering — time per climb</h2>
-
+        <h2 style={h2Style}>Common</h2>
         <div style={grid3}>
           <LabeledNumber label="Your recent max grade (V-scale)" value={vMax} step={0.5} onChange={setVMax} />
           <LabeledNumber
             label="Rest since last climb (days)"
-            helper="Affects a mild 'freshness' factor"
+            helper="Mild 'freshness' factor"
             value={restDays}
             min={0}
             step={1}
             onChange={setRestDays}
           />
           <LabeledNumber
-            label="Avg rest between climbs (s)"
-            helper="Used for density factor"
-            value={avgRestBetweenClimbsSec}
-            min={0}
-            step={5}
-            onChange={setAvgRestBetweenClimbsSec}
+            label="Your 4-week avg TLI (manual)"
+            value={avg28d}
+            onChange={setAvg28d}
+            helper="Used for spike/ratio comparisons"
           />
         </div>
+      </section>
 
-        <div style={grid3}>
-          <LabeledNumber
-            label="Density exponent"
-            helper="0 = ignore density; 0.5 = moderate; 1 = strong"
-            value={densityExp}
-            min={0}
-            max={1}
-            step={0.05}
-            onChange={setDensityExp}
-          />
-          <label style={{ display: "flex", alignItems: "center", gap: 10, fontWeight: 700 }}>
-            <input
-              type="checkbox"
-              checked={useDensity}
-              onChange={(e) => setUseDensity(e.target.checked)}
-              aria-label="Use density factor"
+      {/* Aggregate mode */}
+      {mode === "aggregate" && (
+        <section style={cardStyle}>
+          <h2 style={h2Style}>Bouldering — Aggregate (3 time boxes)</h2>
+          <div style={grid3}>
+            <TimeInput label="Climb Time" value={aggClimbTime} onChange={setAggClimbTime} />
+            <TimeInput label="Total Rest" value={aggRestTime} onChange={setAggRestTime} />
+            <TimeInput
+              label="Total Time"
+              value={aggTotalTime}
+              onChange={setAggTotalTime}
+              helper="Optional; we’ll compute if blank"
             />
-            Use density factor
-          </label>
-          <LabeledNumber
-            label="Fatigue/novelty decay"
-            helper="Per-climb rate; 0 disables (e.g., 0.02)"
-            value={fatigueRate}
-            min={0}
-            max={0.1}
-            step={0.005}
-            onChange={setFatigueRate}
-          />
-        </div>
+          </div>
 
-        <h3 style={h3Style}>Climbs (grade + TUT seconds)</h3>
-        {climbs.map((c, i) => (
-          <div key={i} style={rowClimb}>
-            <LabeledNumber
-              label={`Grade V${c.grade}`}
-              value={c.grade}
-              step={0.5}
-              onChange={(n) => setClimbs((prev) => prev.map((x, idx) => (idx === i ? { ...x, grade: n } : x)))}
-            />
-            <LabeledNumber
-              label="TUT (s)"
-              value={c.tutSec}
-              min={0}
-              step={1}
-              onChange={(n) => setClimbs((prev) => prev.map((x, idx) => (idx === i ? { ...x, tutSec: n } : x)))}
-            />
-            <div style={{ display: "flex", gap: 8 }}>
+          <h3 style={h3Style}>Grades you climbed (time splits evenly)</h3>
+          {aggGrades.map((g, i) => (
+            <div key={i} style={rowClimbAgg}>
+              <LabeledNumber
+                label={`Grade V${g}`}
+                value={g}
+                step={0.5}
+                onChange={(n) => setAggGrades((prev) => prev.map((x, idx) => (idx === i ? n : x)))}
+              />
               <button
-                onClick={() => setClimbs((prev) => prev.filter((_, idx) => idx !== i))}
+                onClick={() => setAggGrades((prev) => prev.filter((_, idx) => idx !== i))}
                 style={buttonGhost}
               >
                 Remove
               </button>
-              <button
-                onClick={() => setClimbs((prev) => {
-                  const row = prev[i];
-                  return [...prev.slice(0, i + 1), { ...row }, ...prev.slice(i + 1)];
-                })}
-                style={button}
-              >
-                Duplicate
-              </button>
             </div>
-          </div>
-        ))}
-        <button onClick={() => setClimbs((prev) => [...prev, { grade: 6, tutSec: 20 }])} style={button}>
-          + Add climb
-        </button>
+          ))}
+          <button onClick={() => setAggGrades((prev) => [...prev, 6])} style={button}>
+            + Add grade
+          </button>
 
-        <div style={{ marginTop: 12, lineHeight: 1.5 }}>
-          <ResultLine label="Total TUT (s)" value={meta.totalTUT} />
-          <ResultLine label="Total rest (s)" value={meta.totalRestWithin} />
-          <ResultLine label="Freshness factor" value={meta.FR} />
-          <ResultLine label={`Density factor${useDensity ? "" : " (disabled)"}`} value={useDensity ? meta.DF : 1} />
-          <ResultLine label="Bouldering TLI" value={TLI_boulder} />
-        </div>
+          <div style={grid3}>
+            <LabeledNumber
+              label="Density exponent"
+              helper="0 = ignore density; 0.5 = moderate; 1 = strong"
+              value={aggDensityExp}
+              min={0}
+              max={1}
+              step={0.05}
+              onChange={setAggDensityExp}
+            />
+            <label style={{ display: "flex", alignItems: "center", gap: 10, fontWeight: 700, marginTop: 16 }}>
+              <input
+                type="checkbox"
+                checked={aggUseDensity}
+                onChange={(e) => setAggUseDensity(e.target.checked)}
+                aria-label="Use density factor"
+              />
+              Use density factor
+            </label>
+            <div />
+          </div>
+
+          <div style={{ marginTop: 12, lineHeight: 1.5 }}>
+            <ResultLine label="Climb Time (s)" value={aggClimbSec} />
+            <ResultLine label="Total Rest (s)" value={aggRestSec} />
+            <ResultLine label="Total Time (s)" value={aggTotalSec} />
+          </div>
+        </section>
+      )}
+
+      {/* Per-climb mode */}
+      {mode === "per-climb" && (
+        <section style={cardStyle}>
+          <h2 style={h2Style}>Bouldering — Per-climb</h2>
+
+          <div style={grid3}>
+            <LabeledNumber
+              label="Avg rest between climbs (s)"
+              helper="Used for density factor"
+              value={avgRestBetweenClimbsSec}
+              min={0}
+              step={5}
+              onChange={setAvgRestBetweenClimbsSec}
+            />
+            <LabeledNumber
+              label="Density exponent"
+              helper="0 = ignore density; 0.5 = moderate; 1 = strong"
+              value={densityExp}
+              min={0}
+              max={1}
+              step={0.05}
+              onChange={setDensityExp}
+            />
+            <label style={{ display: "flex", alignItems: "center", gap: 10, fontWeight: 700, marginTop: 16 }}>
+              <input
+                type="checkbox"
+                checked={useDensity}
+                onChange={(e) => setUseDensity(e.target.checked)}
+                aria-label="Use density factor"
+              />
+              Use density factor
+            </label>
+          </div>
+
+          <div style={grid3}>
+            <LabeledNumber
+              label="Fatigue/novelty decay"
+              helper="Per-climb rate; 0 disables (e.g., 0.02)"
+              value={fatigueRate}
+              min={0}
+              max={0.1}
+              step={0.005}
+              onChange={setFatigueRate}
+            />
+            <div />
+            <div />
+          </div>
+
+          <h3 style={h3Style}>Climbs (grade + TUT seconds)</h3>
+          {climbs.map((c, i) => (
+            <div key={i} style={rowClimb}>
+              <LabeledNumber
+                label={`Grade V${c.grade}`}
+                value={c.grade}
+                step={0.5}
+                onChange={(n) => setClimbs((prev) => prev.map((x, idx) => (idx === i ? { ...x, grade: n } : x)))}
+              />
+              <LabeledNumber
+                label="TUT (s)"
+                value={c.tutSec}
+                min={0}
+                step={1}
+                onChange={(n) => setClimbs((prev) => prev.map((x, idx) => (idx === i ? { ...x, tutSec: n } : x)))}
+              />
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => setClimbs((prev) => prev.filter((_, idx) => idx !== i))}
+                  style={buttonGhost}
+                >
+                  Remove
+                </button>
+                <button
+                  onClick={() =>
+                    setClimbs((prev) => {
+                      const row = prev[i];
+                      return [...prev.slice(0, i + 1), { ...row }, ...prev.slice(i + 1)];
+                    })
+                  }
+                  style={button}
+                >
+                  Duplicate
+                </button>
+              </div>
+            </div>
+          ))}
+          <button onClick={() => setClimbs((prev) => [...prev, { grade: 6, tutSec: 20 }])} style={button}>
+            + Add climb
+          </button>
+        </section>
+      )}
+
+      {/* Explanations (applies to both modes) */}
+      <section style={cardStyle}>
+        <h2 style={h2Style}>What these numbers mean</h2>
+        <ul style={ulStyle}>
+          <li>
+            <strong>TLI (RI·seconds)</strong> = sum of <em>Relative Intensity (RI)</em> × <em>Time Under Tension (TUT)</em>.
+          </li>
+          <li>
+            <strong>RI (boulders)</strong> from grade vs. your recent max. <strong>RI (hangs)</strong> from weight vs. estimated MVC.
+          </li>
+          <li>
+            <strong>Density factor (bouldering)</strong>: <code>DF = (TUT / (TUT + rest))^exp</code>. More rest lowers density and total load.
+          </li>
+          <li>
+            <strong>Rest since last climb</strong>: mild freshness factor (0.85× → ~1.05×).
+          </li>
+          <li>
+            <strong>Per-climb impact</strong>: in Per-climb mode, earlier climbs count slightly more: <code>wᵢ = e^(−rate×(i−1))</code>.
+          </li>
+        </ul>
       </section>
 
       {/* Hangboard */}
       <section style={cardStyle}>
         <h2 style={h2Style}>Hangboard (single row × sets)</h2>
-        <p style={pHelp}>
-          We estimate RI from your body+added weight versus an edge/grip-specific MVC. If unknown, MVC(20mm, half) is
-          approximated as <em>body mass + 20 kg</em>.
-        </p>
         <div style={grid3}>
           <LabeledNumber label="Body (kg)" value={hb.bodyKg} onChange={(n) => setHb({ ...hb, bodyKg: n })} />
           <LabeledNumber label="Added (kg)" value={hb.addedKg} onChange={(n) => setHb({ ...hb, addedKg: n })} />
@@ -398,12 +575,6 @@ export default function Page() {
         <ResultLine label="Total TLI (RI·s)" value={TLI_total} big />
 
         <div style={grid2}>
-          <LabeledNumber
-            label="Your 4-week avg TLI (manual)"
-            value={avg28d}
-            onChange={setAvg28d}
-            helper="Used for spike/ratio comparisons"
-          />
           <div style={{ alignSelf: "end" }}>
             {avg28d > 0 && (
               <Badge
@@ -411,6 +582,10 @@ export default function Page() {
                 text={spikeWarn ? "Spike: > 40% above 4-wk avg" : "Within typical range"}
               />
             )}
+          </div>
+          <div style={{ textAlign: "right", color: "#374151" }}>
+            Mode: <strong>{mode}</strong> • Density factor: <strong>{(meta.DF ?? 1).toFixed(2)}</strong> • Freshness:{" "}
+            <strong>{(meta.FR ?? 1).toFixed(2)}</strong>
           </div>
         </div>
 
@@ -423,24 +598,27 @@ export default function Page() {
           </p>
           <ul style={ulStyle}>
             <li>
-              If you feel lingering soreness or morning stiffness &gt; 24 h, push to the upper end of that range and
-              bias to open/half-crimp next time.
+              If soreness or morning stiffness &gt; 24 h, aim for the upper end and bias to open/half-crimp next time.
             </li>
+            {mode === "per-climb" ? (
+              <li>
+                Earlier climbs weighed slightly more than later ones (rate {fatigueRate}). First climb weight{" "}
+                <strong>{w1.toFixed(2)}×</strong>, 20th <strong>{w20.toFixed(2)}×</strong>.
+              </li>
+            ) : (
+              <li>
+                Aggregate mode uses total times only (no per-climb decay). Switch to Per-climb if you want that detail.
+              </li>
+            )}
             <li>
-              Keep intra-session rests honest: density factor right now is{" "}
-              <strong>{(meta.DF ?? 1).toFixed(2)}</strong> — longer rests lower DF and total load.
-            </li>
-            <li>
-              Earlier climbs weighed slightly more than later ones (fatigue rate {fatigueRate}). First climb weight{" "}
-              <strong>{climbWeight(1, fatigueRate).toFixed(2)}×</strong>, 20th{" "}
-              <strong>{climbWeight(20, fatigueRate).toFixed(2)}×</strong>.
+              Density math: <code>DF = (TUT / (TUT + rest))^{mode === "per-climb" ? densityExp : aggDensityExp}</code>.
             </li>
           </ul>
         </div>
       </section>
 
       <footer style={{ color: "#111827", fontSize: 12, marginTop: 24 }}>
-        v0.2 — time-per-climb, density explained, fatigue weighting, and actionable recommendations.
+        v0.4 — three time boxes for Aggregate mode, no paste/upload, cleaner flow.
       </footer>
     </main>
   );
@@ -451,7 +629,6 @@ export default function Page() {
 ----------------------------*/
 function recommendRestDays(TLI_total: number, ratioToAvg: number) {
   // Simple heuristic blending absolute load and ratio to avg.
-  // Anchor: avg day → ~1 rest day; heavy → 2–3; light → 0–1.
   let min = 1;
   let max = 1;
 
@@ -469,7 +646,6 @@ function recommendRestDays(TLI_total: number, ratioToAvg: number) {
     max = 3;
   }
 
-  // Nudge by absolute magnitude (very small sessions → allow 0 days)
   if (TLI_total < 500) {
     min = 0;
   }
@@ -477,7 +653,7 @@ function recommendRestDays(TLI_total: number, ratioToAvg: number) {
 }
 
 /* ---------------------------
-   Tiny UI primitives (high contrast)
+   Styles & tiny UI primitives
 ----------------------------*/
 const cardStyle: React.CSSProperties = {
   border: "1px solid #111827",
@@ -514,6 +690,13 @@ const grid3: React.CSSProperties = {
 const rowClimb: React.CSSProperties = {
   display: "grid",
   gridTemplateColumns: "1fr 1fr auto",
+  gap: 8,
+  alignItems: "end",
+  marginBottom: 8,
+};
+const rowClimbAgg: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "1fr auto",
   gap: 8,
   alignItems: "end",
   marginBottom: 8,
@@ -591,6 +774,65 @@ function LabeledSelect(props: {
         ))}
       </select>
     </label>
+  );
+}
+
+// Time input with live validation + seconds preview
+function TimeInput(props: { label: string; value: string; onChange: (v: string) => void; helper?: string }) {
+  const { label, value, onChange, helper } = props;
+  const secs = parseHMS(value);
+  const ok = secs !== null;
+  return (
+    <label>
+      <span style={labelStyle}>{label}</span>
+      <input
+        type="text"
+        placeholder="MM:SS or HH:MM:SS"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          ...inputStyle,
+          borderColor: ok ? "#111827" : "#b91c1c",
+          outline: "none",
+        }}
+      />
+      <div style={helperStyle}>
+        {helper ? `${helper} • ` : ""}{ok ? `= ${secs} s (${formatHMS(secs!)})` : "Invalid time"}
+      </div>
+    </label>
+  );
+}
+
+function Toggle({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: { v: string; label: string }[];
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div>
+      {label && <div style={{ ...labelStyle, marginBottom: 8 }}>{label}</div>}
+      <div style={{ display: "flex", gap: 8 }}>
+        {options.map((opt) => (
+          <button
+            key={opt.v}
+            onClick={() => onChange(opt.v)}
+            style={{
+              ...button,
+              background: value === opt.v ? "#111827" : "#fff",
+              color: value === opt.v ? "#fff" : "#111827",
+            }}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
